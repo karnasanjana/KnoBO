@@ -28,7 +28,9 @@ class MultiClassLogisticRegression(nn.Module):
     def __init__(self, num_features, num_classes, prior, apply_prior=False):
         super(MultiClassLogisticRegression, self).__init__()
         self.linear = nn.Linear(num_features, num_classes)
-        self.prior = prior.cuda() # prior is a weight matrix has the same shape as the weight matrix of the linear layer
+        # prior is a weight matrix has the same shape as the weight matrix of the linear layer
+        device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        self.prior = prior.to(device)
         self.apply_prior = apply_prior
     
     def forward(self, x):

@@ -12,32 +12,47 @@ random.seed(42)
 
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
+# Get the workspace root directory (parent of modules folder)
+WORKSPACE_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
 
 def load_classifier_list(args):
-    with open(f"./data/bottlenecks/{args.modality}_{args.bottleneck}.txt", "r") as f:
-        concepts = f.read().strip().split("\n")
+    bottleneck_file = os.path.join(WORKSPACE_ROOT, f"data/bottlenecks/{args.modality}_{args.bottleneck}.txt")
+    with open(bottleneck_file, "r") as f:
+        concepts = [c.strip() for c in f.read().strip().split("\n")]
     
-    model_path = f"./data/grounding_functions/{args.modality}"
+    model_path = os.path.join(WORKSPACE_ROOT, f"data/grounding_functions/{args.modality}")
     classifier_list = {}
     if args.bottleneck == "random":
         for c in concepts:
             classifier_list[c] = [LogisticRegression(max_iter=1000), 0.5]
     else:
+        missing = []
         for c in concepts:
-            model_full_path = f"{model_path}/{c}/{c}.p"
+            # Convert concept name to folder name (replace ? with _)
+            folder_name = c.replace("?", "_")
+            model_full_path = f"{model_path}/{folder_name}/{folder_name}.p"
+            
             # check existence of the model
             if not os.path.exists(model_full_path):
-                print(f"Model for {c} does not exist")
+                missing.append(c)
                 continue
+            
             curr_model = pickle.load(open(model_full_path, "rb"))
 
-            with open(f"{model_path}/{c}/{c}_results.txt", "r") as f:
+            # Load results file
+            results_path = model_full_path.replace(".p", "_results.txt")
+            
+            with open(results_path, "r") as f:
                 results = f.read().strip().split(",")
                 val_acc = float(results[-1].strip())
 
             if val_acc >= args.acc_threshold:
                 classifier_list[c] = (curr_model, val_acc)
-    
+
+        if missing:
+            print(f"WARNING: {len(missing)}/{len(concepts)} concepts in {args.modality}_{args.bottleneck} have no grounding function in {model_path} (skipped)")
+
     # sort the classifiers based on the accuracy
     classifier_list = {k: v for k, v in sorted(classifier_list.items(), key=lambda item: item[1][1], reverse=True)}
     if args.number_of_features < len(classifier_list):
@@ -159,17 +174,17 @@ def load_features(feature_path, label2index, shots, normalize, random_seed):
         ood_path_list = [f"{ood_path}/{ll}/{yp}" for yp in os.listdir(f"{ood_path}/{ll}")]
 
         for yp in train_path_list:
-            train_tmp.extend(torch.load(yp))
+            train_tmp.extend(torch.load(yp, weights_only=False))
 
         tmp_train_label.extend([label2index[ll]] * len(train_tmp))
 
         for tp in val_path_list:
-            val_tmp.extend(torch.load(tp))
+            val_tmp.extend(torch.load(tp, weights_only=False))
 
         tmp_val_label.extend([label2index[ll]] * len(val_tmp))
 
         for opp in ood_path_list:
-            ood_tmp.extend(torch.load(opp))
+            ood_tmp.extend(torch.load(opp, weights_only=False))
 
         ood_label.extend([label2index[ll]] * len(ood_tmp))
         tmp_train_list.extend(train_tmp)
@@ -213,7 +228,8 @@ def load_features(feature_path, label2index, shots, normalize, random_seed):
 
 def get_prior_matrix(modality, class_names, concepts):
     prior = torch.zeros(len(class_names), len(concepts))
-    class2concept2answer = json.load(open(f"./data/bottlenecks/concept_priors/{modality}_class2concept2answer.json", "r"))
+    prior_file = os.path.join(WORKSPACE_ROOT, f"data/bottlenecks/concept_priors/{modality}_class2concept2answer.json")
+    class2concept2answer = json.load(open(prior_file, "r"))
 
     for i, c in enumerate(class_names):
         for j, q in enumerate(concepts):
@@ -255,7 +271,9 @@ def map_weights(model, class_names, concepts):
 
 def get_diversity_score(concepts):
     from sentence_transformers import SentenceTransformer, util
-    sbert_model = SentenceTransformer('all-mpnet-base-v2', device = "cuda:0", cache_folder = "/nlp/data/yueyang/packages/sentence_transformer/")
+    device_str = "cuda:0" if torch.cuda.is_available() else "cpu"
+    # Use default cache folder instead of hardcoded path
+    sbert_model = SentenceTransformer('all-mpnet-base-v2', device=device_str)
     
     sentence_embeddings = sbert_model.encode(concepts, convert_to_tensor=True)
 

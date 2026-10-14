@@ -5,3 +5,6 @@ clip
 open_clip_torch
 wandb
 scikit-learn
+tqdm
+sentence-transformers
+pandas

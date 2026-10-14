@@ -3,3 +3,6 @@ __pycache__/
 wandb/
 data/
 MedRAG/
+*.zip
+output.log
+quick_diagnostic.py
