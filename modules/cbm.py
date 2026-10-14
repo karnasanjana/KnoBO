@@ -9,7 +9,8 @@ from argparse import ArgumentParser, ArgumentTypeError
 import torch.nn as nn
 from torch import optim
 from torch.optim.lr_scheduler import ReduceLROnPlateau
-from torch.utils.data import DataLoader, TensorDataset
+import numpy as np
+from sklearn.model_selection import train_test_split
 
 # Add current directory to path for imports
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -32,22 +33,32 @@ def str2bool(v):
     raise ArgumentTypeError(f"Boolean value expected, got {v}")
 
 
-def train_model(model, train_dataloader, val_dataloader, optimizer, criterion, num_epochs, patience=30, prior_weight=1.0):
+def iterate_batches(X, y, batch_size, shuffle=False):
+    # Slice in-memory tensors directly; DataLoader + TensorDataset collates sample by sample and dominates runtime
+    order = torch.randperm(len(X), device=X.device) if shuffle else torch.arange(len(X), device=X.device)
+    for i in range(0, len(X), batch_size):
+        idx = order[i:i + batch_size]
+        yield X[idx], y[idx]
+
+
+def train_model(model, train_data, select_data, optimizer, criterion, num_epochs, batch_size, patience=30, prior_weight=1.0):
     """
     Enhanced training with early stopping and learning rate scheduling.
+    train_data / select_data: (X, y) tensor tuples; select_data is used for model selection
     patience: number of epochs with no improvement before stopping
     """
     best_val_acc = -float("inf")
     best_model = None
     patience_counter = 0
-    
+    num_batches = (len(train_data[0]) + batch_size - 1) // batch_size
+
     # Learning rate scheduler: reduce LR if validation accuracy plateaus
     scheduler = ReduceLROnPlateau(optimizer, mode='max', factor=0.5, patience=10)
-    
+
     for epoch in range(num_epochs):
         model.train()
         train_loss = 0
-        for X_batch, y_batch in train_dataloader:
+        for X_batch, y_batch in iterate_batches(*train_data, batch_size, shuffle=True):
             optimizer.zero_grad()
             outputs = model(X_batch)
             loss = criterion(outputs, y_batch.long())
@@ -61,8 +72,9 @@ def train_model(model, train_dataloader, val_dataloader, optimizer, criterion, n
             train_loss += loss.item()
         
         # evaluate the model
-        val_acc = evaluate_model(model, val_dataloader)
-        print(f"Epoch {epoch + 1}/{num_epochs}, Train Loss: {train_loss / len(train_dataloader):.4f}, Val Acc: {val_acc:.2f}")
+        val_acc = evaluate_model(model, select_data)
+        if (epoch + 1) % 20 == 0:
+            print(f"Epoch {epoch + 1}/{num_epochs}, Train Loss: {train_loss / num_batches:.4f}, Val Acc: {val_acc:.2f}")
             
         if val_acc > best_val_acc:
             best_val_acc = val_acc
@@ -82,38 +94,29 @@ def train_model(model, train_dataloader, val_dataloader, optimizer, criterion, n
     return best_model
 
 
-def evaluate_model(model, dataloader):
+def evaluate_model(model, data):
+    X, y = data
     model.eval()
-    correct = 0
-    total = 0
     with torch.no_grad():
-        for X_batch, y_batch in dataloader:
-            outputs = model(X_batch)
-            _, predicted = torch.max(outputs.data, 1)
-            total += y_batch.size(0)
-            correct += (predicted == y_batch).sum().item()
-    accuracy = 100 * correct / total
-    
+        predicted = model(X).argmax(dim=1)
+    accuracy = 100 * (predicted == y).sum().item() / len(y)
+
     return accuracy
 
 
-def get_results(args, label2index, classifier_list, df_train_log, y_train, df_val_log, y_val, df_ood_log, y_ood):
+def to_tensors(df, labels):
+    return torch.tensor(df.values).float().to(device), torch.tensor(np.asarray(labels)).to(device)
+
+
+def get_results(args, label2index, classifier_list, df_train_log, y_train, df_val_log, y_val, df_ood_log, y_ood, df_select_log=None, y_select=None):
     batch_size, learning_rate, num_epochs = args.batch_size, args.lr, args.epochs
     # Convert features and labels to PyTorch tensors
-    X_train_torch = torch.tensor(df_train_log.values).float().to(device)
-    y_train_torch = torch.tensor(y_train).to(device)
-    X_val_torch = torch.tensor(df_val_log.values).float().to(device)
-    y_val_torch = torch.tensor(y_val).to(device)
-    X_ood_torch = torch.tensor(df_ood_log.values).float().to(device)
-    y_ood_torch = torch.tensor(y_ood).to(device)
-
-    # Create DataLoader instances with optimized batch size for better convergence
-    train_dataset = TensorDataset(X_train_torch, y_train_torch)
-    val_dataset = TensorDataset(X_val_torch, y_val_torch)
-    ood_dataset = TensorDataset(X_ood_torch, y_ood_torch)
-    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
-    val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False)
-    ood_loader = DataLoader(ood_dataset, batch_size=batch_size, shuffle=False)
+    train_data = to_tensors(df_train_log, y_train)
+    val_data = to_tensors(df_val_log, y_val)
+    ood_data = to_tensors(df_ood_log, y_ood)
+    # Without a held-out split, fall back to selecting on the in-domain test set (original KnoBo protocol)
+    select_data = to_tensors(df_select_log, y_select) if df_select_log is not None else val_data
+    X_train_torch, y_train_torch = train_data
 
     num_classes = len(torch.unique(y_train_torch))  # Assuming y_train contains all classes
     class_names = list(label2index.keys())
@@ -138,11 +141,11 @@ def get_results(args, label2index, classifier_list, df_train_log, y_train, df_va
     optimizer = optim.AdamW(model.parameters(), lr=learning_rate, weight_decay=args.weight_decay)
 
     # Train the model with enhanced training
-    best_model = train_model(model, train_loader, val_loader, optimizer, criterion, num_epochs, patience=args.patience, prior_weight=args.prior_weight)
+    best_model = train_model(model, train_data, select_data, optimizer, criterion, num_epochs, batch_size, patience=args.patience, prior_weight=args.prior_weight)
 
     # Evaluate the model
-    val_acc = evaluate_model(best_model, val_loader)
-    ood_acc = evaluate_model(best_model, ood_loader)
+    val_acc = evaluate_model(best_model, val_data)
+    ood_acc = evaluate_model(best_model, ood_data)
 
     average_acc = round((val_acc + ood_acc) / 2, 2)
     gap = round(abs(val_acc - ood_acc), 2)
@@ -167,9 +170,19 @@ def run_classification(args, dataset_name, classifier_list, clip_model, tokenize
     elif args.mode == "pcbm":
         df_train_log, df_val_log, df_ood_log = pcbm_features(X_train, X_val, X_ood, classifier_list, clip_model, tokenizer, preprocess, args.number_of_features)
 
-    print("Train size: ", df_train_log.shape, "Test size: ", df_val_log.shape, "OOD size: ", df_ood_log.shape)
+    df_select_log, y_select = None, None
+    if args.holdout_frac > 0:
+        if args.shots != "all":
+            print("Few-shot run: too little data to hold out a selection split, selecting on the test set")
+        else:
+            # Hold out part of train for model selection so the reported in-domain accuracy is unbiased
+            train_idx, select_idx = train_test_split(np.arange(len(y_train)), test_size=args.holdout_frac, stratify=y_train, random_state=random_seed)
+            df_select_log, y_select = df_train_log.iloc[select_idx].reset_index(drop=True), y_train[select_idx]
+            df_train_log, y_train = df_train_log.iloc[train_idx].reset_index(drop=True), y_train[train_idx]
 
-    val_acc, ood_acc, gap, average_acc, best_model = get_results(args, label2index, classifier_list, df_train_log, y_train, df_val_log, y_val, df_ood_log, y_ood)
+    print("Train size: ", df_train_log.shape, "Select size: ", None if df_select_log is None else df_select_log.shape, "Test size: ", df_val_log.shape, "OOD size: ", df_ood_log.shape)
+
+    val_acc, ood_acc, gap, average_acc, best_model = get_results(args, label2index, classifier_list, df_train_log, y_train, df_val_log, y_val, df_ood_log, y_ood, df_select_log, y_select)
 
     print(f"Dataset: {dataset_name}, Mode: {args.mode}", f"Shots: {args.shots}", f"Model: {args.model_name}")
     print(f"Ind Acc: {val_acc}, OOD Acc: {ood_acc}, Gap: {gap}, Average: {average_acc}")
@@ -180,12 +193,23 @@ def run_classification(args, dataset_name, classifier_list, clip_model, tokenize
 
 def run_all_datasets(args, dataset_lists, classifier_list, clip_model, tokenizer, preprocess):
     results_dict = {}
+    std_dict = {}
     for dataset_name in dataset_lists:
-        ind_acc, out_acc, gap, avg, number_of_features_actual = run_classification(args, dataset_name, classifier_list, clip_model, tokenizer, preprocess)
-        results_dict[dataset_name] = {"ind_acc": ind_acc, "out_acc": out_acc, "gap": gap, "avg": avg}
+        seed_results = []
+        for seed in args.seeds:
+            random.seed(seed)
+            torch.manual_seed(seed)
+            ind_acc, out_acc, gap, avg, number_of_features_actual = run_classification(args, dataset_name, classifier_list, clip_model, tokenizer, preprocess, random_seed=seed)
+            seed_results.append({"ind_acc": ind_acc, "out_acc": out_acc, "gap": gap, "avg": avg})
+        seed_df = pd.DataFrame(seed_results)
+        results_dict[dataset_name] = seed_df.mean().round(2).to_dict()
+        std_dict[dataset_name] = seed_df.std(ddof=0).round(2).to_dict()
 
-    # reshape to one row
+    # reshape to one row; with several seeds, values are means and *_std columns hold the spread
     csv_df = pd.DataFrame.from_dict(results_dict).T
+    if len(args.seeds) > 1:
+        std_df = pd.DataFrame.from_dict(std_dict).T.add_suffix("_std")
+        csv_df = pd.concat([csv_df, std_df], axis=1)
     # Reshape the data
     reshaped_df = pd.DataFrame(csv_df.values.flatten()).T
 
@@ -200,6 +224,8 @@ def run_all_datasets(args, dataset_lists, classifier_list, clip_model, tokenizer
     file_name = os.path.join(workspace_root, f"data/results/{args.modality}_{args.mode}_{args.model_name}_{args.bottleneck}_{args.shots}_{number_of_features_actual}_{args.save_suffix}.csv")
 
     if args.add_prior: file_name = file_name.replace(".csv", "_prior.csv")
+    if args.holdout_frac > 0: file_name = file_name.replace(".csv", "_holdout.csv")
+    if len(args.seeds) > 1: file_name = file_name.replace(".csv", f"_{len(args.seeds)}seeds.csv")
     
     # creat folder if not exist
     if not os.path.exists(os.path.dirname(file_name)):
@@ -218,6 +244,8 @@ def run_all_datasets(args, dataset_lists, classifier_list, clip_model, tokenizer
     print(f"  • Learning Rate: {args.lr} (AdamW, weight_decay={args.weight_decay}, ReduceLROnPlateau)")
     print(f"  • Batch Size: {args.batch_size}")
     print(f"  • Prior Weight: {args.prior_weight if args.add_prior else 'n/a'}")
+    print(f"  • Model Selection: {f'{args.holdout_frac:.0%} of train held out' if args.holdout_frac > 0 else 'in-domain test set (original protocol)'}")
+    print(f"  • Seeds: {args.seeds}{' (table shows means)' if len(args.seeds) > 1 else ''}")
     print("-"*90)
     print(f"{'Dataset':<20} {'Ind Acc %':<14} {'OOD Acc %':<14} {'Gap %':<14} {'Average %':<14}")
     print("-"*90)
@@ -268,6 +296,8 @@ if __name__ == "__main__":
     parser.add_argument("--batch_size", type=int, default=24, help="batch size")
     parser.add_argument("--weight_decay", type=float, default=1e-5, help="AdamW weight decay")
     parser.add_argument("--prior_weight", type=float, default=0.5, help="weight of the prior loss (paper uses 1.0)")
+    parser.add_argument("--holdout_frac", type=float, default=0.1, help="fraction of train held out for model selection; 0 selects on the in-domain test set (original protocol)")
+    parser.add_argument("--seeds", type=int, nargs="+", default=[42], help="random seeds; results are averaged across seeds")
 
     args = parser.parse_args()
 
